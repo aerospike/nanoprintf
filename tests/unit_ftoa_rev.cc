@@ -15,9 +15,23 @@ static void memrev(char *lhs, char *rhs) {
   }
 }
 
+/* Whichever %f conversion this TU compiled. npf_ftoa_rev fuses generation with
+   placement and takes the precision directly; npf_etoa_rev serves %f when the sci
+   conversions are compiled in and reads it from the spec. Both produce the same
+   reversed buffer, so every case below runs against both. */
+static int npf_f_conv(char *buf, double dbl) {
+#if (NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1) || \
+    (NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1)
+  spec.conv_spec = NPF_FMT_SPEC_CONV_FLOAT_DEC;
+  return npf_etoa_rev(buf, &spec, dbl);
+#else
+  return npf_ftoa_rev(buf, &spec, spec.prec, dbl);
+#endif
+}
+
 static void require_ftoa_rev(std::string const &expected, double dbl) {
-  char buf[NANOPRINTF_CONVERSION_BUFFER_SIZE + 1];
-  int const n = [&](){ int x = npf_ftoa_rev(buf, &spec, dbl); return x < 0 ? -x : x; }();
+  char buf[NPF_CBUF + 1];
+  int const n = [&](){ int x = npf_f_conv(buf, dbl); return x < 0 ? -x : x; }();
   REQUIRE(n <= NANOPRINTF_CONVERSION_BUFFER_SIZE);
   memrev(buf, &buf[n]);
   buf[n] = '\0';
@@ -32,7 +46,7 @@ static void require_ftoa_rev_bin(char const *expected, npf_real_bin_t bin) {
 }
 
 #ifndef NPF_FTOA_REV_CUSTOM_CONFIG
-TEST_CASE("ftoa_rev") {
+TEST_CASE("ftoa_rev" NPF_FLOAT_PATH) {
   memset(&spec, 0, sizeof(spec));
 
   SUBCASE("special values") {
@@ -41,7 +55,7 @@ TEST_CASE("ftoa_rev") {
     require_ftoa_rev("INF", (double)+INFINITY);
     require_ftoa_rev("INF", (double)-INFINITY);
     require_ftoa_rev("ERR", DBL_MAX);
-    spec.prec = NANOPRINTF_CONVERSION_BUFFER_SIZE - 2;
+    spec.prec = NPF_CBUF - 2;
     require_ftoa_rev("ERR", 10.);
     spec.prec += 1;
     require_ftoa_rev("ERR", 9.);
@@ -59,19 +73,19 @@ TEST_CASE("ftoa_rev") {
   }
 
   SUBCASE("rounding") {
-    require_ftoa_rev("9", 8.5);
+    require_ftoa_rev("8", 8.5); // exact ties round to even
     require_ftoa_rev("10", 9.5);
-    require_ftoa_rev("49", 48.5);
+    require_ftoa_rev("48", 48.5);
     require_ftoa_rev("50", 49.5);
-    require_ftoa_rev("99", 98.5);
+    require_ftoa_rev("98", 98.5);
     require_ftoa_rev("100", 99.5);
 
     require_ftoa_rev("0", 0.40625);
-    require_ftoa_rev("1", 0.5);
+    require_ftoa_rev("0", 0.5);
 
     spec.prec = 1;
     require_ftoa_rev("0.3", 0.34375);
-    require_ftoa_rev("0.3", 0.25);
+    require_ftoa_rev("0.2", 0.25);
     require_ftoa_rev("0.9", 0.9375);
     require_ftoa_rev("1.0", 0.96875);
 

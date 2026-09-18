@@ -16,6 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int npf_test_pass_count;
@@ -139,6 +140,15 @@ int NPF_TEST_FUNC(void) {
     /* NUL char: %c with '\0' must return 1, not 0 */
     NPF_TEST_RET(1, "%c", 0);
 
+    /* %c converts its int argument to unsigned char; the high bits are dropped */
+    NPF_TEST("a", "%c", 'a' + 256);
+    NPF_TEST("a", "%c", 'a' - 256);
+    NPF_TEST("a", "%c", (int)('a' + (UINT_MAX << 8)));
+    NPF_TEST("\xff", "%c", 0xFF);
+    NPF_TEST("\xff", "%c", 0xFF - 256);
+    NPF_TEST("\xff", "%c", 0x100 + 0xFF);
+    NPF_TEST_RET(1, "%c", 0x100);
+
     NPF_TEST("A", "%+c", 'A');
 
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
@@ -256,6 +266,16 @@ int NPF_TEST_FUNC(void) {
 #endif
     NPF_TEST("32767", "%hd", SHRT_MAX);
     NPF_TEST("-32768", "%hd", SHRT_MIN);
+    /* 'hh' and 'h' convert the promoted int argument to signed char / short,
+       even when the caller passes a value that doesn't fit. */
+    NPF_TEST("0", "%hhi", INT_MIN);
+    NPF_TEST("-1", "%hhi", INT_MAX);
+    NPF_TEST("-1", "%hhi", (int)UINT_MAX);
+    NPF_TEST("0", "%hi", INT_MIN);
+    NPF_TEST("-1", "%hi", INT_MAX);
+    NPF_TEST("-1", "%hi", (int)UINT_MAX);
+    NPF_TEST("-32768", "%hi", 32768);
+    NPF_TEST("-128", "%hhi", 0x7F00 + 128);
 #endif
 
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
@@ -519,6 +539,16 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("4660", "%hu", (unsigned short)0x1234u);
     NPF_TEST("255", "%hhu", (unsigned char)UCHAR_MAX);
     NPF_TEST("65535", "%hu", (unsigned short)USHRT_MAX);
+    /* 'hh' and 'h' convert the promoted unsigned argument to unsigned char /
+       unsigned short, even when the caller passes a value that doesn't fit. */
+    NPF_TEST("0", "%hhu", INT_MIN);
+    NPF_TEST("255", "%hhu", UINT_MAX);
+    NPF_TEST("0", "%hu", INT_MIN);
+    NPF_TEST("65535", "%hu", UINT_MAX);
+    NPF_TEST("377", "%hho", UINT_MAX);
+    NPF_TEST("177777", "%ho", UINT_MAX);
+    NPF_TEST("ff", "%hhx", UINT_MAX);
+    NPF_TEST("ffff", "%hx", UINT_MAX);
 #endif
 
 #if ULONG_MAX > UINT_MAX
@@ -1001,6 +1031,8 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("11111111", "%hhb", 0xFFu);
     NPF_TEST("0", "%hhb", 256u);
     NPF_TEST("1111111111111111", "%hb", 0xFFFFu);
+    NPF_TEST("11111111", "%hhb", UINT_MAX);
+    NPF_TEST("1111111111111111", "%hb", UINT_MAX);
 #endif
 
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
@@ -1080,6 +1112,20 @@ int NPF_TEST_FUNC(void) {
       npf_pprintf(npf_test_null_putc, 0, "%u%s%n", 0, "abcd", &wb);
       NPF_TEST_WB(5, wb); }
 
+    /* An argument behind %n. A writeback that failed to consume its own pointer
+       would leave every later conversion reading the wrong slot. */
+    { int wb = -1;
+      NPF_TEST("abcd1234", "%s%n%i", "abcd", &wb, 1234);
+      NPF_TEST_WB(4, wb); }
+
+    /* The writeback stores through the modifier's type, so nothing on either side
+       of the target may move. volatile is what keeps the guard reads, which can
+       only fail on UB, from being folded away. */
+    { struct { volatile int lo; int wb; volatile int hi; } g;
+      g.lo = -1; g.wb = -1; g.hi = -1;
+      npf_pprintf(npf_test_null_putc, 0, "1234%n", &g.wb);
+      NPF_TEST_WB(4, g.wb); NPF_TEST_WB(-1, g.lo); NPF_TEST_WB(-1, g.hi); }
+
     /* snprintf writeback */
     { char wbbuf[100]; int wb = 1234;
       npf_snprintf(wbbuf, sizeof(wbbuf), "%n", &wb);
@@ -1099,10 +1145,26 @@ int NPF_TEST_FUNC(void) {
     { short wb = -1;
       npf_pprintf(npf_test_null_putc, 0, "1234%hn", &wb);
       NPF_TEST_WB(4, wb); }
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    /* writeback truncates to the modifier's type, like the value conversions:
+       a count of 200 wraps to -56 in a signed char */
+    { signed char wb = 0;
+      npf_pprintf(npf_test_null_putc, 0, "%200d%hhn", 0, &wb);
+      NPF_TEST_WB(-56, wb); }
+#endif
     /* writeback char */
     { signed char wb = -1;
       npf_pprintf(npf_test_null_putc, 0, "1234567%hhn", &wb);
       NPF_TEST_WB(7, wb); }
+
+    /* A store wider than the modifier's type would run into the bytes behind the
+       target. An array rather than neighboring members so that no padding can
+       absorb it, and volatile so the guard reads survive. */
+    { signed char wb[4]; signed char volatile *v = wb;
+      wb[0] = -1; wb[1] = -1; wb[2] = -1; wb[3] = -1;
+      npf_pprintf(npf_test_null_putc, 0, "1234%hhn", &wb[0]);
+      NPF_TEST_WB(4, v[0]);
+      NPF_TEST_WB(-1, v[1]); NPF_TEST_WB(-1, v[2]); NPF_TEST_WB(-1, v[3]); }
 #endif
 
 #if NANOPRINTF_USE_LARGE_FORMAT_SPECIFIERS == 1
@@ -1125,6 +1187,369 @@ int NPF_TEST_FUNC(void) {
 #endif
 #endif /* NANOPRINTF_USE_WRITEBACK_FORMAT_SPECIFIERS */
 
+    /* ===== fixed-width length modifiers ===== */
+#if NANOPRINTF_USE_FIXED_WIDTH_FORMAT_SPECIFIERS == 1
+    /* 'wN' selects int_leastN_t / uint_leastN_t, which is the same type as
+       intN_t / uintN_t wherever the exact-width type exists. Those are exactly N
+       bits wide, so on the CHAR_BIT == 8 targets this file already assumes for
+       'hh' and 'h', the promoted argument truncates to a written-out value. */
+    NPF_TEST("0", "%w8d", 0);
+    NPF_TEST("127", "%w8d", 127);
+    NPF_TEST("-128", "%w8d", 128);
+    NPF_TEST("-1", "%w8d", 255);
+    NPF_TEST("0", "%w8d", 256);
+    NPF_TEST("44", "%w8i", 300);
+    NPF_TEST("-1", "%w8i", -1);
+    NPF_TEST("-1", "%w8i", INT_MAX);
+    NPF_TEST("0", "%w8i", INT_MIN);
+    NPF_TEST("255", "%w8u", 255u);
+    NPF_TEST("0", "%w8u", 256u);
+    NPF_TEST("255", "%w8u", UINT_MAX);
+    NPF_TEST("ff", "%w8x", UINT_MAX);
+    NPF_TEST("FF", "%w8X", UINT_MAX);
+    NPF_TEST("377", "%w8o", UINT_MAX);
+
+    NPF_TEST("0", "%w16d", 0);
+    NPF_TEST("32767", "%w16d", 32767);
+    NPF_TEST("-32768", "%w16d", 32768);
+    NPF_TEST("-1", "%w16d", 65535);
+    NPF_TEST("0", "%w16d", 65536);
+    NPF_TEST("-1", "%w16i", INT_MAX);
+    NPF_TEST("65535", "%w16u", 65535u);
+    NPF_TEST("0", "%w16u", 65536u);
+    NPF_TEST("65535", "%w16u", UINT_MAX);
+    NPF_TEST("ffff", "%w16x", UINT_MAX);
+    NPF_TEST("177777", "%w16o", UINT_MAX);
+
+    NPF_TEST("0", "%w32d", (int32_t)0);
+    NPF_TEST("-1", "%w32d", (int32_t)-1);
+    NPF_TEST("2147483647", "%w32d", (int32_t)INT32_MAX);
+    NPF_TEST("-2147483648", "%w32d", (int32_t)INT32_MIN);
+    NPF_TEST("4294967295", "%w32u", (uint32_t)UINT32_MAX);
+    NPF_TEST("ffffffff", "%w32x", (uint32_t)UINT32_MAX);
+    NPF_TEST("37777777777", "%w32o", (uint32_t)UINT32_MAX);
+
+#if NPF_W_BITS_MAX == 64
+    NPF_TEST("-1", "%w64d", (int64_t)-1);
+    NPF_TEST("9223372036854775807", "%w64d", (int64_t)INT64_MAX);
+    NPF_TEST("-9223372036854775808", "%w64d", (int64_t)INT64_MIN);
+    NPF_TEST("18446744073709551615", "%w64u", (uint64_t)UINT64_MAX);
+    NPF_TEST("ffffffffffffffff", "%w64x", (uint64_t)UINT64_MAX);
+#endif
+
+#if NANOPRINTF_USE_BINARY_FORMAT_SPECIFIERS == 1
+    NPF_TEST("11111111", "%w8b", UINT_MAX);
+    NPF_TEST("1111111111111111", "%w16b", UINT_MAX);
+    NPF_TEST("11111111111111111111111111111111", "%w32b", (uint32_t)UINT32_MAX);
+    NPF_TEST("11111111", "%w8B", UINT_MAX);
+    NPF_TEST("101", "%wf8b", (uint_fast8_t)5);
+#endif
+
+    /* the return value counts the converted length, not the specifier's */
+    NPF_TEST_RET(2, "%w8d", 42);
+    NPF_TEST_RET(3, "%w8d", 200);   /* (int8_t)200 == -56 */
+    NPF_TEST_RET(3, "%w16u", 65535u + 1u + 999u);
+
+    /* The minimum-width and fastest-minimum-width types are only guaranteed to
+       be at least N bits, so these expectations are built from the value. Every
+       one goes through the widest value the type can hold, which is what catches
+       a length modifier that reads the wrong number of bytes back out. */
+#define NPF_TEST_WS(fmt, type, val) do { \
+      type npf_ws_v = (type)(val); \
+      char npf_ws_exp[32]; \
+      snprintf(npf_ws_exp, sizeof(npf_ws_exp), "%lld", (long long)npf_ws_v); \
+      NPF_TEST_DYN(npf_ws_exp, fmt, npf_ws_v); \
+    } while (0)
+
+#define NPF_TEST_WU(fmt, sys_fmt, type, val) do { \
+      type npf_wu_v = (type)(val); \
+      char npf_wu_exp[32]; \
+      snprintf(npf_wu_exp, sizeof(npf_wu_exp), sys_fmt, (unsigned long long)npf_wu_v); \
+      NPF_TEST_DYN(npf_wu_exp, fmt, npf_wu_v); \
+    } while (0)
+
+    NPF_TEST_WS("%w8d", int_least8_t, INT_LEAST8_MAX);
+    NPF_TEST_WS("%w8d", int_least8_t, INT_LEAST8_MIN);
+    NPF_TEST_WS("%w8i", int_least8_t, -1);
+    NPF_TEST_WU("%w8u", "%llu", uint_least8_t, UINT_LEAST8_MAX);
+    NPF_TEST_WU("%w8x", "%llx", uint_least8_t, UINT_LEAST8_MAX);
+    NPF_TEST_WS("%w16d", int_least16_t, INT_LEAST16_MAX);
+    NPF_TEST_WS("%w16d", int_least16_t, INT_LEAST16_MIN);
+    NPF_TEST_WU("%w16u", "%llu", uint_least16_t, UINT_LEAST16_MAX);
+    NPF_TEST_WS("%w32d", int_least32_t, INT_LEAST32_MAX);
+    NPF_TEST_WS("%w32d", int_least32_t, INT_LEAST32_MIN);
+    NPF_TEST_WU("%w32u", "%llu", uint_least32_t, UINT_LEAST32_MAX);
+    NPF_TEST_WU("%w32X", "%llX", uint_least32_t, UINT_LEAST32_MAX);
+
+    NPF_TEST_WS("%wf8d", int_fast8_t, 0);
+    NPF_TEST_WS("%wf8d", int_fast8_t, -1);
+    NPF_TEST_WS("%wf8d", int_fast8_t, INT_FAST8_MAX);
+    NPF_TEST_WS("%wf8d", int_fast8_t, INT_FAST8_MIN);
+    NPF_TEST_WU("%wf8u", "%llu", uint_fast8_t, UINT_FAST8_MAX);
+    NPF_TEST_WU("%wf8x", "%llx", uint_fast8_t, UINT_FAST8_MAX);
+    NPF_TEST_WU("%wf8o", "%llo", uint_fast8_t, UINT_FAST8_MAX);
+    NPF_TEST_WS("%wf16d", int_fast16_t, -1);
+    NPF_TEST_WS("%wf16d", int_fast16_t, INT_FAST16_MAX);
+    NPF_TEST_WS("%wf16d", int_fast16_t, INT_FAST16_MIN);
+    NPF_TEST_WU("%wf16u", "%llu", uint_fast16_t, UINT_FAST16_MAX);
+    NPF_TEST_WU("%wf16X", "%llX", uint_fast16_t, UINT_FAST16_MAX);
+    NPF_TEST_WS("%wf32d", int_fast32_t, -1);
+    NPF_TEST_WS("%wf32d", int_fast32_t, INT_FAST32_MAX);
+    NPF_TEST_WS("%wf32d", int_fast32_t, INT_FAST32_MIN);
+    NPF_TEST_WU("%wf32u", "%llu", uint_fast32_t, UINT_FAST32_MAX);
+    NPF_TEST_WU("%wf32o", "%llo", uint_fast32_t, UINT_FAST32_MAX);
+#if NPF_W_BITS_MAX == 64
+    NPF_TEST_WS("%w64d", int_least64_t, INT_LEAST64_MAX);
+    NPF_TEST_WS("%w64d", int_least64_t, INT_LEAST64_MIN);
+    NPF_TEST_WU("%w64u", "%llu", uint_least64_t, UINT_LEAST64_MAX);
+    NPF_TEST_WS("%wf64d", int_fast64_t, -1);
+    NPF_TEST_WS("%wf64d", int_fast64_t, INT_FAST64_MAX);
+    NPF_TEST_WS("%wf64d", int_fast64_t, INT_FAST64_MIN);
+    NPF_TEST_WU("%wf64u", "%llu", uint_fast64_t, UINT_FAST64_MAX);
+    NPF_TEST_WU("%wf64x", "%llx", uint_fast64_t, UINT_FAST64_MAX);
+#endif
+#undef NPF_TEST_WS
+#undef NPF_TEST_WU
+
+    /* A modifier that resolved to the wrong width would read the wrong number of
+       bytes and leave the rest of the argument list misaligned, so every width is
+       also run with a second conversion behind it. */
+    NPF_TEST("42|7", "%w8d|%d", 42, 7);
+    NPF_TEST("42|7", "%w16d|%d", 42, 7);
+    NPF_TEST("42|7", "%w32d|%d", (int32_t)42, 7);
+    NPF_TEST("42|7", "%wf8d|%d", (int_fast8_t)42, 7);
+    NPF_TEST("42|7", "%wf16d|%d", (int_fast16_t)42, 7);
+    NPF_TEST("42|7", "%wf32d|%d", (int_fast32_t)42, 7);
+#if NPF_W_BITS_MAX == 64
+    NPF_TEST("42|7", "%w64d|%d", (int64_t)42, 7);
+    NPF_TEST("42|7", "%wf64d|%d", (int_fast64_t)42, 7);
+    NPF_TEST("1|2|3|4|5", "%w8d|%w16d|%w32d|%w64d|%d",
+             1, 2, (int32_t)3, (int64_t)4, 5);
+#else
+    NPF_TEST("1|2|3|4", "%w8d|%w16d|%w32d|%d", 1, 2, (int32_t)3, 4);
+#endif
+    /* mixed with the classic modifiers, which share the same extraction paths */
+    NPF_TEST("1|2|3|4", "%w8d|%hhd|%w16d|%hd", 1, 2, 3, 4);
+
+    /* Truncation of the promoted argument. The expectation comes from the type,
+       so these hold on a target where int_leastN_t is wider than N bits (any
+       CHAR_BIT other than 8) as well. Skipped where the type is wider than int,
+       since then the argument would not be an int in the first place.
+
+       The preprocessor draws that line, from the type's maximum rather than its
+       sizeof: a signed type is no wider than int exactly when its maximum fits in
+       INT_MAX. An `if` over the sizeof would say the same thing, but a condition
+       the compiler can fold is what MSVC's C4127 objects to, and C has no
+       `if constexpr` to say "yes, on purpose" with. */
+#define NPF_TEST_WPROMO(fmt, type, raw) do { \
+      char npf_wp_exp[32]; \
+      snprintf(npf_wp_exp, sizeof(npf_wp_exp), "%lld", (long long)(type)(raw)); \
+      NPF_TEST_DYN(npf_wp_exp, fmt, (int)(raw)); \
+    } while (0)
+
+#if INT_LEAST8_MAX <= INT_MAX
+    NPF_TEST_WPROMO("%w8d", int_least8_t, 0);
+    NPF_TEST_WPROMO("%w8d", int_least8_t, 127);
+    NPF_TEST_WPROMO("%w8d", int_least8_t, 128);
+    NPF_TEST_WPROMO("%w8d", int_least8_t, 255);
+    NPF_TEST_WPROMO("%w8d", int_least8_t, 256);
+    NPF_TEST_WPROMO("%w8d", int_least8_t, 300);
+    NPF_TEST_WPROMO("%w8d", int_least8_t, -1);
+    NPF_TEST_WPROMO("%w8i", int_least8_t, INT_MAX);
+    NPF_TEST_WPROMO("%w8i", int_least8_t, INT_MIN);
+#endif
+#if INT_LEAST16_MAX <= INT_MAX
+    NPF_TEST_WPROMO("%w16d", int_least16_t, 32767);
+    NPF_TEST_WPROMO("%w16d", int_least16_t, 32768);
+    NPF_TEST_WPROMO("%w16d", int_least16_t, 65535);
+    NPF_TEST_WPROMO("%w16d", int_least16_t, 65536);
+    NPF_TEST_WPROMO("%w16i", int_least16_t, INT_MAX);
+#endif
+#if INT_FAST8_MAX <= INT_MAX
+    NPF_TEST_WPROMO("%wf8d", int_fast8_t, 300);
+    NPF_TEST_WPROMO("%wf8d", int_fast8_t, -1);
+#endif
+#if INT_FAST16_MAX <= INT_MAX
+    NPF_TEST_WPROMO("%wf16d", int_fast16_t, 70000);
+    NPF_TEST_WPROMO("%wf16d", int_fast16_t, -1);
+#endif
+#undef NPF_TEST_WPROMO
+
+    /* The design claim, asserted directly: at a width whose stdint type is the
+       same type a classic modifier names, the two specifiers agree exactly.
+
+       Which widths those are is again a question for the preprocessor, and again
+       answered through the maxima: two integer types of one signedness hold the
+       same values exactly when their maxima match, which is the property these
+       cases actually rest on. */
+#define NPF_TEST_WSAME(wfmt, cfmt, ...) do { \
+      char npf_wq_a[64], npf_wq_b[64]; \
+      npf_snprintf(npf_wq_a, sizeof(npf_wq_a), wfmt, __VA_ARGS__); \
+      npf_snprintf(npf_wq_b, sizeof(npf_wq_b), cfmt, __VA_ARGS__); \
+      if (strcmp(npf_wq_a, npf_wq_b) != 0) { \
+        fprintf(stderr, "FAIL [%s:%d]: \"%s\"=\"%s\" \"%s\"=\"%s\"\n", \
+                __FILE__, __LINE__, wfmt, npf_wq_a, cfmt, npf_wq_b); \
+        ++npf_test_fail_count; \
+      } else { ++npf_test_pass_count; } \
+    } while (0)
+
+#if INT_LEAST8_MAX == SCHAR_MAX
+    NPF_TEST_WSAME("%w8d", "%hhd", 300);
+    NPF_TEST_WSAME("%w8i", "%hhi", -1);
+#endif
+#if UINT_LEAST8_MAX == UCHAR_MAX
+    NPF_TEST_WSAME("%w8u", "%hhu", 511u);
+    NPF_TEST_WSAME("%w8x", "%hhx", UINT_MAX);
+    NPF_TEST_WSAME("%w8o", "%hho", UINT_MAX);
+#endif
+#if INT_LEAST16_MAX == SHRT_MAX
+    NPF_TEST_WSAME("%w16d", "%hd", 70000);
+#endif
+#if UINT_LEAST16_MAX == USHRT_MAX
+    NPF_TEST_WSAME("%w16u", "%hu", UINT_MAX);
+#endif
+#if INT_LEAST32_MAX == INT_MAX
+    NPF_TEST_WSAME("%w32d", "%d", (int32_t)-12345);
+#endif
+#if INT_FAST8_MAX == SCHAR_MAX
+    NPF_TEST_WSAME("%wf8d", "%hhd", 300);
+#endif
+#if INT_FAST8_MAX == INT_MAX
+    NPF_TEST_WSAME("%wf8d", "%d", 300);
+#endif
+#if INT_FAST16_MAX == INT_MAX
+    NPF_TEST_WSAME("%wf16d", "%d", 70000);
+#endif
+#if NANOPRINTF_USE_LARGE_FORMAT_SPECIFIERS == 1
+#if INT_LEAST64_MAX == LLONG_MAX
+    NPF_TEST_WSAME("%w64d", "%lld", (long long)INT64_MIN);
+#endif
+#if UINT_LEAST64_MAX == ULLONG_MAX
+    NPF_TEST_WSAME("%w64x", "%llx", (unsigned long long)UINT64_MAX);
+#endif
+#endif
+#if INT_LEAST64_MAX == LONG_MAX
+    NPF_TEST_WSAME("%w64d", "%ld", (long)-12345);
+#endif
+#undef NPF_TEST_WSAME
+
+    /* Flags, field width and precision all apply as usual. */
+    NPF_TEST("+127", "%+w8d", 127);
+    NPF_TEST(" 127", "% w8d", 127);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("  -1", "%4w8d", 255);
+    NPF_TEST("-1  ", "%-4w8d", 255);
+    NPF_TEST("-001", "%04w8d", 255);
+    NPF_TEST("  -1", "%*w8d", 4, 255);
+#endif
+#if (NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1) && \
+    (NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1)
+    NPF_TEST("  -01", "%*.*w8d", 5, 2, 255);
+#endif
+#if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
+    NPF_TEST("-001", "%.3w8d", 255);
+    NPF_TEST("", "%.0w8d", 256);
+    NPF_TEST("0ff", "%.3w8x", UINT_MAX);
+#endif
+#if NANOPRINTF_USE_ALT_FORM_FLAG == 1
+    NPF_TEST("0xff", "%#w8x", UINT_MAX);
+    NPF_TEST("0377", "%#w8o", UINT_MAX);
+#endif
+
+    /* N must be one of the widths stdint.h is required to define; anything else
+       fails to parse and the specifier is emitted verbatim. */
+    NPF_TEST("%wd", "%wd", 5);
+    NPF_TEST("%w", "%w");
+    NPF_TEST("%wf", "%wf");
+    NPF_TEST("%w1", "%w1");
+    NPF_TEST("%wfd", "%wfd", 5);
+    NPF_TEST("%w0d", "%w0d", 5);
+    NPF_TEST("%w1d", "%w1d", 5);
+    NPF_TEST("%w08d", "%w08d", 5);
+    NPF_TEST("%wf08d", "%wf08d", 5);
+    NPF_TEST("%w7d", "%w7d", 5);
+    NPF_TEST("%w9d", "%w9d", 5);
+    NPF_TEST("%w24d", "%w24d", 5);
+    NPF_TEST("%w33d", "%w33d", 5);
+    NPF_TEST("%w48d", "%w48d", 5);
+    NPF_TEST("%w65d", "%w65d", 5);
+    NPF_TEST("%w99d", "%w99d", 5);
+    NPF_TEST("%w128d", "%w128d", 5);
+    NPF_TEST("%w160d", "%w160d", 5);
+    NPF_TEST("%w644d", "%w644d", 5);
+    NPF_TEST("%w4294967296d", "%w4294967296d", 5);
+    NPF_TEST("%w3", "%w3");
+    NPF_TEST("%w6", "%w6");
+    NPF_TEST("%w8", "%w8");
+    NPF_TEST("%wf16", "%wf16");
+    NPF_TEST("a%w7db", "a%w7db", 5);
+    NPF_TEST("[%wd]", "[%wd]", 5);
+    NPF_TEST("x%wy", "x%wy");
+    NPF_TEST("ok 5", "ok %w8d", 5);
+    NPF_TEST("%wf7d", "%wf7d", 5);
+    NPF_TEST("%wf24d", "%wf24d", 5);
+    NPF_TEST("%wf128d", "%wf128d", 5);
+    NPF_TEST("%ww8d", "%ww8d", 5);
+    NPF_TEST("%wff8d", "%wff8d", 5);
+#if NPF_W_BITS_MAX < 64
+    /* Nothing in this build carries a 64-bit type. */
+    NPF_TEST("%w64d", "%w64d", 5);
+    NPF_TEST("%wf64d", "%wf64d", 5);
+#endif
+
+    /* A format string that ends inside a 'w' specifier must stop at the
+       terminator. Run from an exactly-sized heap buffer so that reading one
+       byte past it is a real overrun for a sanitizer to catch. */
+    { static char const *const npf_w_cut[] = {
+        "%w", "%wf", "%w1", "%w3", "%w6", "%w8", "%w16", "%wf1", "%wf3", "%wf6"
+      };
+      size_t npf_w_i;
+      for (npf_w_i = 0; npf_w_i < sizeof(npf_w_cut) / sizeof(npf_w_cut[0]); ++npf_w_i) {
+        size_t const npf_w_n = strlen(npf_w_cut[npf_w_i]) + 1;
+        char *npf_w_f = (char *)malloc(npf_w_n);
+        memcpy(npf_w_f, npf_w_cut[npf_w_i], npf_w_n);
+        npf_snprintf(npf_test_buf, sizeof(npf_test_buf), npf_w_f);
+        NPF_TEST_WB(0, strcmp(npf_test_buf, npf_w_cut[npf_w_i]));
+        free(npf_w_f);
+      }
+    }
+
+#if NANOPRINTF_USE_WRITEBACK_FORMAT_SPECIFIERS == 1
+    /* 'n' writes back through a pointer to the fixed-width type, so a modifier
+       that resolved to the wrong width would store past the object. */
+#define NPF_TEST_WN(fmt, type) do { \
+      union { type v; unsigned char b[sizeof(type) + 8]; } npf_wn; \
+      int npf_wn_clean = 1; size_t npf_wn_i; \
+      memset(&npf_wn, 0x5A, sizeof(npf_wn)); \
+      npf_pprintf(npf_test_null_putc, 0, "abc" fmt, &npf_wn.v); \
+      NPF_TEST_WB(3, npf_wn.v); \
+      for (npf_wn_i = sizeof(type); npf_wn_i < sizeof(npf_wn.b); ++npf_wn_i) { \
+        if (npf_wn.b[npf_wn_i] != 0x5A) { npf_wn_clean = 0; } \
+      } \
+      NPF_TEST_WB(1, npf_wn_clean); \
+    } while (0)
+
+    NPF_TEST_WN("%w8n", int_least8_t);
+    NPF_TEST_WN("%w16n", int_least16_t);
+    NPF_TEST_WN("%w32n", int_least32_t);
+    NPF_TEST_WN("%wf8n", int_fast8_t);
+    NPF_TEST_WN("%wf16n", int_fast16_t);
+    NPF_TEST_WN("%wf32n", int_fast32_t);
+#if NPF_W_BITS_MAX == 64
+    NPF_TEST_WN("%w64n", int_least64_t);
+    NPF_TEST_WN("%wf64n", int_fast64_t);
+#endif
+#undef NPF_TEST_WN
+
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    /* the count truncates to the fixed-width type, like the value conversions */
+    { int_least8_t wb = 0;
+      npf_pprintf(npf_test_null_putc, 0, "%200d%w8n", 0, &wb);
+      NPF_TEST_WB(-56, wb); }
+#endif
+#endif /* NANOPRINTF_USE_WRITEBACK_FORMAT_SPECIFIERS */
+#endif /* NANOPRINTF_USE_FIXED_WIDTH_FORMAT_SPECIFIERS */
+
     /* ===== star args ===== */
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
     NPF_TEST("         Z", "%*c", 10, 'Z');
@@ -1137,6 +1562,14 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("-42       ", "%*d", -10, -42);
     NPF_TEST("x         ", "%*c", -10, 'x');
     NPF_TEST("hello     ", "%*s", -10, "hello");
+    /* A field width past the edge of int saturates at NPF_FMT_NUM_MAX. INT_MIN
+       has no positive counterpart, so negating it to left-justify would be UB;
+       a literal that far out would wrap negative and drop the padding. */
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%*d", INT_MIN, 7);
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%*d", INT_MAX, 7);
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%2147483647d", 7);
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%2147483648d", 7);
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%99999999999d", 7);
 #endif
 
 #if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
@@ -1148,15 +1581,41 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("0", "%.*d", -1, 0);
     NPF_TEST("hello", "%.*s", -1, "hello");
     NPF_TEST("hello world", "%.*s", -1, "hello world");
+    /* negative literal precision = precision omitted, digits must not leak */
+    NPF_TEST("42", "%.-5d", 42);
+    NPF_TEST("2b", "%.-5x", 0x2bu);
+    NPF_TEST("hello world", "%.-5s", "hello world");
+    /* A precision past the edge of int saturates the same way a field width
+       does. Left to wrap, it goes negative and the '0'-padding count with it. */
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%.*d", INT_MAX, 7);
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%.2147483647d", 7);
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%.2147483648d", 7);
+    NPF_TEST_RET(NPF_FMT_NUM_MAX, "%.99999999999d", 7);
+    NPF_TEST("hello world", "%.99999999999s", "hello world");
+#if NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 1
+    NPF_TEST("1.500000", "%.-3f", 1.5);
+    NPF_TEST("1.500000", "%.*f", -3, 1.5);
+#endif
 #endif
 
 #if (NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1) && \
     (NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1)
     NPF_TEST("        07", "%*.*i", 10, 2, 7);
+    /* an ignored precision must not cancel the '0' flag either */
+    NPF_TEST("0000000002", "%010.*i", -1, 2);
+    NPF_TEST("-000000002", "%010.*d", -1, -2);
+    NPF_TEST("0000000002", "%010.*u", -1, 2u);
+    NPF_TEST("000000002b", "%010.*x", -1, 0x2bu);
+    NPF_TEST("0000000042", "%010.-5d", 42);
+#if NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 1
+    NPF_TEST("001.234000", "%010.*f", -5, 1.234);
+    NPF_TEST("001.500000", "%010.-5f", 1.5);
+#endif
 #endif
 
     /* ===== float ===== */
-#if NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 1
+#if (NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 1) && \
+    (NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1)
     /* nan */
     {
         char nan_buf[32];
@@ -1183,8 +1642,12 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("-inf", "%f", -(double)INFINITY);
     NPF_TEST("inf", "%.100f", (double)INFINITY);
     NPF_TEST("inf", "%.10f", (double)INFINITY);
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
     NPF_TEST("inf", "%.10e", (double)INFINITY);
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
     NPF_TEST("inf", "%.10g", (double)INFINITY);
+#endif
 #if NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER == 1
     NPF_TEST("inf", "%.10a", (double)INFINITY);
 #endif
@@ -1247,7 +1710,7 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("42.90", "%.2f", 42.8952);
     NPF_TEST("4.0", "%.1f", 3.999);
     NPF_TEST("4", "%.0f", 3.5);
-    NPF_TEST("5", "%.0f", 4.5);
+    NPF_TEST("4", "%.0f", 4.5);
     NPF_TEST("3", "%.0f", 3.49);
     NPF_TEST("3.5", "%.1f", 3.49);
 #if NANOPRINTF_USE_FLOAT_SINGLE_PRECISION != 1
@@ -1486,8 +1949,10 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("0x1p+0", "%1.0a", 1.0);
     NPF_TEST("-0x1p+0", "%1.0a", -1.0);
 
-    /* zero with zero-pad + explicit precision 0 (known: pads with space, not '0') */
-    NPF_TEST("    0x0p+0", "%010.0a", 0.0);
+    /* zero with zero-pad + explicit precision 0: the "no digits, so no '0' pad"
+       rule is integers only, so this pads with '0' like the system does */
+    NPF_TEST("0x00000p+0", "%010.0a", 0.0);
+    NPF_TEST("-0x0000p+0", "%010.0a", -0.0);
 
 #if NANOPRINTF_USE_ALT_FORM_FLAG == 1
     /* alt form + zero-pad + width */
@@ -1565,6 +2030,15 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("1.5 2.5 3.5", "%.1f %.1f %.1f", 1.5f, 2.5f, 3.5f);
     NPF_TEST("hello 42 3.14 !", "%s %d %.2f %c", "hello", 42, 3.14f, '!');
 
+    {
+      struct { unsigned u : 3; signed s : 4; unsigned w : 20; } const bf =
+        { .u = 5u, .s = -3, .w = 100000u };
+      NPF_TEST("5", "%u", bf.u);
+      NPF_TEST("-3", "%d", bf.s);
+      NPF_TEST("100000", "%u", bf.w);
+      NPF_TEST("5 -3 1.5", "%u %d %.1f", bf.u, bf.s, 1.5f);
+    }
+
     /* single-precision: double literals auto-narrowed via NPF_MAP_ARGS */
     NPF_TEST("3.14", "%.2f", 3.14);
     NPF_TEST("42.500000", "%f", 42.5);
@@ -1627,7 +2101,486 @@ int NPF_TEST_FUNC(void) {
     NPF_TEST("0.000000", "%f", FLT_MIN / 2.0f);
     NPF_TEST("0.000000000000000000000000000000000000011754943", "%.45f", FLT_MIN);
 #endif
-#endif /* NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS */
+
+    /* ===== float scientific (%e/%E) and shortest (%g/%G) ===== */
+
+    /* Specials share npf_ftoa_rev's packed strings; the '0' flag is dropped for
+       them because the payload is text rather than a number. */
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("inf", "%e", (double)INFINITY);
+    NPF_TEST("INF", "%E", (double)INFINITY);
+    NPF_TEST("-inf", "%e", -(double)INFINITY);
+    NPF_TEST("+inf", "%+e", (double)INFINITY);
+    NPF_TEST("nan", "%e", (double)NAN);
+    NPF_TEST("NAN", "%E", (double)NAN);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("         inf", "%12e", (double)INFINITY);
+    NPF_TEST("         inf", "%012e", (double)INFINITY);
+#endif
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("inf", "%g", (double)INFINITY);
+    NPF_TEST("INF", "%G", (double)INFINITY);
+    NPF_TEST("-inf", "%g", -(double)INFINITY);
+    NPF_TEST(" inf", "% g", (double)INFINITY);
+    NPF_TEST("nan", "%g", (double)NAN);
+    NPF_TEST("NAN", "%G", (double)NAN);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("inf         ", "%-12g", (double)INFINITY);
+#endif
+#endif
+
+    /* A precision the conversion buffer cannot hold reports err. The longest
+       output is "d.<prec>e+ddd", so %e needs 7 bytes of slack and %g needs 6. */
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("err", "%.100e", 1.0);
+    NPF_TEST("ERR", "%.100E", 1.0);
+    NPF_TEST("err", "%.*e", NPF_CBUF - 7, 1.0);
+    NPF_TEST_RET(NPF_CBUF - 2,
+                 "%.*e", NPF_CBUF - 8, 1.0);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("         err", "%12.100e", 1.0);
+    NPF_TEST("err         ", "%-12.100e", 1.0);
+#endif
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("err", "%.100g", 1.0);
+    NPF_TEST("ERR", "%.100G", 1.0);
+    NPF_TEST("err", "%.*g", NPF_CBUF - 6, 1.0);
+    NPF_TEST("1", "%.*g", NPF_CBUF - 7, 1.0);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("err         ", "%-12.100g", 1.0);
+#endif
+#endif
+
+    /* A precision at or past the edge of int. Literals saturate rather than
+       wrapping negative, and no arithmetic on the way to the conversion may
+       overflow: either failure lets a negative precision reach the digit
+       layout, which indexes below the conversion buffer. */
+    NPF_TEST("err", "%.2147483647f", 1.0);
+    NPF_TEST("err", "%.2147483648f", 1.0);
+    NPF_TEST("err", "%.99999999999f", 1.0);
+    NPF_TEST("err", "%.*f", INT_MAX, 1.0);
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("err", "%.2147483647e", 1.0);
+    NPF_TEST("err", "%.2147483648e", 1.0);
+    NPF_TEST("err", "%.99999999999e", 1.0);
+    NPF_TEST("err", "%.*e", INT_MAX, 1.0);
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("err", "%.2147483647g", 1.0);
+    NPF_TEST("err", "%.2147483648g", 1.0);
+    NPF_TEST("err", "%.99999999999g", 1.0);
+    NPF_TEST("err", "%.*g", INT_MAX, 1.0);
+#endif
+
+    /* Star-supplied field width and precision. A negative star precision is
+       discarded, so the conversion falls back to its default of 6. */
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("1.500e+00", "%.*e", 3, 1.5);
+    NPF_TEST("1.500000e+00", "%.*e", -1, 1.5);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("      1.50e+00", "%*.*e", 14, 2, 1.5);
+    NPF_TEST("1.50e+00      ", "%-*.*e", 14, 2, 1.5);
+    NPF_TEST("1.50e+00      ", "%*.*e", -14, 2, 1.5);
+#endif
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("1.5", "%.*g", 3, 1.5);
+    NPF_TEST("1.5", "%.*g", -1, 1.5);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("           1.5", "%*.*g", 14, 2, 1.5);
+    NPF_TEST("1.5           ", "%-*.*g", 14, 2, 1.5);
+#endif
+#endif
+
+    /* Regression: a precision of 0 skips the fraction scaling loop, so the
+       mantissa keeps raw bits that can be all ones. Nudging it for rounding used
+       to wrap to zero and lose the carry, rounding 0.9999999999 down to "0". */
+    NPF_TEST("1", "%.0f", 0.9999999999);
+    NPF_TEST("2", "%.0f", 1.9999999999);
+    NPF_TEST("10", "%.0f", 9.9999999999);
+    NPF_TEST("124", "%.0f", 123.9999999999);
+    NPF_TEST("3", "%.0F", 2.9999999999);
+    NPF_TEST("1", "%.0f", 0.99999999999999);
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("1e+00", "%.0e", 0.9999999999);
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("1", "%.1g", 0.9999999999);
+#endif
+
+    /* Regression: "precision 0 with a zero value produces no digits, so the '0'
+       flag is meaningless" is an integer rule. "%.0f" of 0 still prints "0". */
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("00000000000000000000", "%020.0f", 0.0);
+    NPF_TEST("00000000", "%08.0f", 0.0);
+    NPF_TEST("-0000000", "%08.0f", -0.0);
+    NPF_TEST("        ", "%08.0d", 0); /* integers keep the old behavior */
+    NPF_TEST("        ", "%08.0u", 0u);
+    NPF_TEST("        ", "%08.0x", 0u);
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("0000000000000000e+00", "%020.0e", 0.0);
+    NPF_TEST("0000e+00", "%08.0e", 0.0);
+    NPF_TEST("-000e+00", "%08.0e", -0.0);
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("00000000000000000000", "%020.0g", 0.0);
+    NPF_TEST("00000000", "%08.0g", 0.0);
+#endif
+#endif
+
+    /* Verified against the system printf by tests/gen_eg_tests.py. */
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("0.000000e+00", "%e", 0.0); /* basic */
+    NPF_TEST("0.000000E+00", "%E", 0.0); /* basic */
+    NPF_TEST("-0.000000e+00", "%e", -0.0); /* basic */
+    NPF_TEST("-0.000000E+00", "%E", -0.0); /* basic */
+    NPF_TEST("1.500000e+00", "%e", 1.5); /* basic */
+    NPF_TEST("1.500000E+00", "%E", 1.5); /* basic */
+    NPF_TEST("-1.500000e+00", "%e", -1.5); /* basic */
+    NPF_TEST("-1.500000E+00", "%E", -1.5); /* basic */
+    NPF_TEST("1.000000e-05", "%e", 1e-5); /* basic */
+    NPF_TEST("1.000000E-05", "%E", 1e-5); /* basic */
+    NPF_TEST("+1.500000e+00", "%+e", 1.5); /* basic */
+    NPF_TEST("-1.500000e+00", "%+e", -1.5); /* basic */
+    NPF_TEST(" 1.500000e+00", "% e", 1.5); /* basic */
+    NPF_TEST("-1.500000e+00", "% e", -1.5); /* basic */
+    NPF_TEST("2e+00", "%.0e", 1.5); /* basic */
+    NPF_TEST("-2e+00", "%.0e", -1.5); /* basic */
+    NPF_TEST("1.500e+00", "%.3e", 1.5); /* basic */
+    NPF_TEST("-1.500e+00", "%.3e", -1.5); /* basic */
+    NPF_TEST("1.00e+00", "%.2e", 1.0); /* exponent */
+    NPF_TEST("1.00E+00", "%.2E", 1.0); /* exponent */
+    NPF_TEST("1.00e+09", "%.2e", 1e9); /* exponent */
+    NPF_TEST("1.00E+09", "%.2E", 1e9); /* exponent */
+    NPF_TEST("1.00e-09", "%.2e", 1e-9); /* exponent */
+    NPF_TEST("1.00E-09", "%.2E", 1e-9); /* exponent */
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("0", "%g", 0.0); /* basic */
+    NPF_TEST("0", "%G", 0.0); /* basic */
+    NPF_TEST("-0", "%g", -0.0); /* basic */
+    NPF_TEST("-0", "%G", -0.0); /* basic */
+    NPF_TEST("1.5", "%g", 1.5); /* basic */
+    NPF_TEST("1.5", "%G", 1.5); /* basic */
+    NPF_TEST("-1.5", "%g", -1.5); /* basic */
+    NPF_TEST("-1.5", "%G", -1.5); /* basic */
+    NPF_TEST("1e-05", "%g", 1e-5); /* basic */
+    NPF_TEST("1E-05", "%G", 1e-5); /* basic */
+    NPF_TEST("+1.5", "%+g", 1.5); /* basic */
+    NPF_TEST("-1.5", "%+g", -1.5); /* basic */
+    NPF_TEST(" 1.5", "% g", 1.5); /* basic */
+    NPF_TEST("-1.5", "% g", -1.5); /* basic */
+    NPF_TEST("2", "%.0g", 1.5); /* basic */
+    NPF_TEST("-2", "%.0g", -1.5); /* basic */
+    NPF_TEST("1.5", "%.3g", 1.5); /* basic */
+    NPF_TEST("-1.5", "%.3g", -1.5); /* basic */
+    NPF_TEST("1e-05", "%.1g", 1e-5); /* g-style */
+    NPF_TEST("0.0001", "%.1g", 1e-4); /* g-style */
+    NPF_TEST("0.1", "%.1g", 0.1); /* g-style */
+    NPF_TEST("1", "%.1g", 1.0); /* g-style */
+    NPF_TEST("1e+01", "%.1g", 10.0); /* g-style */
+    NPF_TEST("1e-05", "%.6g", 1e-5); /* g-style */
+    NPF_TEST("0.0001", "%.6g", 0.0001); /* g-style */
+    NPF_TEST("100000", "%.6g", 100000.0); /* g-style */
+    NPF_TEST("1e+06", "%.6g", 1000000.0); /* g-style */
+    NPF_TEST("1e+02", "%.2g", 100.0); /* g-style */
+    NPF_TEST("1e+06", "%.4g", 999999.0); /* g-style */
+    NPF_TEST("1e+07", "%.4g", 1e7); /* g-style */
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+#if NANOPRINTF_USE_ALT_FORM_FLAG == 1
+    NPF_TEST("0.000000e+00", "%#e", 0.0); /* alt-form */
+    NPF_TEST("0.000000E+00", "%#E", 0.0); /* alt-form */
+    NPF_TEST("1.000000e+00", "%#e", 1.0); /* alt-form */
+    NPF_TEST("1.000000E+00", "%#E", 1.0); /* alt-form */
+    NPF_TEST("1.000000e+02", "%#e", 100.0); /* alt-form */
+    NPF_TEST("1.000000E+02", "%#E", 100.0); /* alt-form */
+    NPF_TEST("1.000000e-05", "%#e", 1e-5); /* alt-form */
+    NPF_TEST("1.000000E-05", "%#E", 1e-5); /* alt-form */
+    NPF_TEST("1.e+00", "%#.0e", 1.0); /* alt-form */
+    NPF_TEST("1.0000e+00", "%#.4e", 1.0); /* alt-form */
+#endif
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("        0.000000e+00", "%20e", 0.0); /* width */
+    NPF_TEST("0.000000e+00        ", "%-20e", 0.0); /* width */
+    NPF_TEST("000000000.000000e+00", "%020e", 0.0); /* width */
+    NPF_TEST("0000000000000000e+00", "%020.0e", 0.0); /* width */
+    NPF_TEST("0000e+00", "%08.0e", 0.0); /* width */
+    NPF_TEST("          +0.000e+00", "%+20.3e", 0.0); /* width */
+    NPF_TEST("       -0.000000e+00", "%20e", -0.0); /* width */
+    NPF_TEST("-0.000000e+00       ", "%-20e", -0.0); /* width */
+    NPF_TEST("-00000000.000000e+00", "%020e", -0.0); /* width */
+    NPF_TEST("-000000000000000e+00", "%020.0e", -0.0); /* width */
+    NPF_TEST("-000e+00", "%08.0e", -0.0); /* width */
+    NPF_TEST("          -0.000e+00", "%+20.3e", -0.0); /* width */
+    NPF_TEST("        1.500000e+00", "%20e", 1.5); /* width */
+    NPF_TEST("1.500000e+00        ", "%-20e", 1.5); /* width */
+    NPF_TEST("000000001.500000e+00", "%020e", 1.5); /* width */
+    NPF_TEST("0000000000000002e+00", "%020.0e", 1.5); /* width */
+    NPF_TEST("0002e+00", "%08.0e", 1.5); /* width */
+    NPF_TEST("          +1.500e+00", "%+20.3e", 1.5); /* width */
+    NPF_TEST("       -1.500000e+00", "%20e", -1.5); /* width */
+    NPF_TEST("-1.500000e+00       ", "%-20e", -1.5); /* width */
+    NPF_TEST("-00000001.500000e+00", "%020e", -1.5); /* width */
+    NPF_TEST("-000000000000002e+00", "%020.0e", -1.5); /* width */
+    NPF_TEST("-002e+00", "%08.0e", -1.5); /* width */
+    NPF_TEST("          -1.500e+00", "%+20.3e", -1.5); /* width */
+#endif
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+#if NANOPRINTF_USE_FLOAT_SINGLE_PRECISION != 1
+    NPF_TEST("1.000000e+100", "%e", 1e100); /* basic */
+    NPF_TEST("1.000000E+100", "%E", 1e100); /* basic */
+    NPF_TEST("1.00e+100", "%.2e", 1e100); /* exponent */
+    NPF_TEST("1.00E+100", "%.2E", 1e100); /* exponent */
+    NPF_TEST("1.00e-100", "%.2e", 1e-100); /* exponent */
+    NPF_TEST("1.00E-100", "%.2E", 1e-100); /* exponent */
+#endif
+#endif
+
+    /* An integer in [2^23, 2^24) reaches digit generation with the mantissa
+       already in place: no base-10 scaling of the integer part, and no fraction
+       bits at all. The digits are the whole expansion, so a dropped '5' with
+       nothing under it is an exact tie and rounds to even. */
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+#if NANOPRINTF_USE_FLOAT_SINGLE_PRECISION == 1
+    NPF_TEST("1.234560e+07", "%.6e", 12345605.0f);
+    NPF_TEST("1.23456e+07", "%.5e", 12345650.0f);
+    NPF_TEST("1.234562e+07", "%.6e", 12345615.0f); /* odd kept digit rounds up */
+    NPF_TEST("8.38860e+06", "%.5e", 8388605.0f);   /* below 2^23: fraction path */
+#endif
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+#if NANOPRINTF_USE_ALT_FORM_FLAG == 1
+    NPF_TEST("0.00000", "%#g", 0.0); /* alt-form */
+    NPF_TEST("0.00000", "%#G", 0.0); /* alt-form */
+    NPF_TEST("1.00000", "%#g", 1.0); /* alt-form */
+    NPF_TEST("1.00000", "%#G", 1.0); /* alt-form */
+    NPF_TEST("100.000", "%#g", 100.0); /* alt-form */
+    NPF_TEST("100.000", "%#G", 100.0); /* alt-form */
+    NPF_TEST("1.00000e-05", "%#g", 1e-5); /* alt-form */
+    NPF_TEST("1.00000E-05", "%#G", 1e-5); /* alt-form */
+    NPF_TEST("1.", "%#.0g", 1.0); /* alt-form */
+    NPF_TEST("1.000", "%#.4g", 1.0); /* alt-form */
+#endif
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("                   0", "%20g", 0.0); /* width */
+    NPF_TEST("0                   ", "%-20g", 0.0); /* width */
+    NPF_TEST("00000000000000000000", "%020g", 0.0); /* width */
+    NPF_TEST("00000000000000000000", "%020.0g", 0.0); /* width */
+    NPF_TEST("00000000", "%08.0g", 0.0); /* width */
+    NPF_TEST("00000000000000000000", "%020.3g", 0.0); /* width */
+    NPF_TEST("                  -0", "%20g", -0.0); /* width */
+    NPF_TEST("-0                  ", "%-20g", -0.0); /* width */
+    NPF_TEST("-0000000000000000000", "%020g", -0.0); /* width */
+    NPF_TEST("-0000000000000000000", "%020.0g", -0.0); /* width */
+    NPF_TEST("-0000000", "%08.0g", -0.0); /* width */
+    NPF_TEST("-0000000000000000000", "%020.3g", -0.0); /* width */
+    NPF_TEST("                 1.5", "%20g", 1.5); /* width */
+    NPF_TEST("1.5                 ", "%-20g", 1.5); /* width */
+    NPF_TEST("000000000000000001.5", "%020g", 1.5); /* width */
+    NPF_TEST("00000000000000000002", "%020.0g", 1.5); /* width */
+    NPF_TEST("00000002", "%08.0g", 1.5); /* width */
+    NPF_TEST("000000000000000001.5", "%020.3g", 1.5); /* width */
+    NPF_TEST("                -1.5", "%20g", -1.5); /* width */
+    NPF_TEST("-1.5                ", "%-20g", -1.5); /* width */
+    NPF_TEST("-00000000000000001.5", "%020g", -1.5); /* width */
+    NPF_TEST("-0000000000000000002", "%020.0g", -1.5); /* width */
+    NPF_TEST("-0000002", "%08.0g", -1.5); /* width */
+    NPF_TEST("-00000000000000001.5", "%020.3g", -1.5); /* width */
+#endif
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+#if NANOPRINTF_USE_FLOAT_SINGLE_PRECISION != 1
+    NPF_TEST("1e+100", "%g", 1e100); /* basic */
+    NPF_TEST("1E+100", "%G", 1e100); /* basic */
+#endif
+#endif
+
+#endif /* NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS && PRECISION_FORMAT_SPECIFIERS */
+
+    /* ===== float with precision compiled out =====
+
+       Every conversion runs at the default precision it would have picked anyway,
+       so these are the same strings the precision-enabled build produces for a
+       format with no '.' in it. Values are exact in both float and double so the
+       single-precision build agrees. */
+#if (NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 1) && \
+    (NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 0)
+    NPF_TEST("0.000000", "%f", 0.0);
+    NPF_TEST("1.500000", "%f", 1.5);
+    NPF_TEST("-1.500000", "%f", -1.5);
+    NPF_TEST("0.003906", "%f", 0.00390625);
+    NPF_TEST("123456.000000", "%f", 123456.0);
+    NPF_TEST("1.500000", "%F", 1.5);
+    NPF_TEST("+1.500000", "%+f", 1.5);
+    NPF_TEST(" 1.500000", "% f", 1.5);
+    NPF_TEST("inf", "%f", (double)INFINITY);
+    NPF_TEST("-INF", "%F", (double)-INFINITY);
+#if NANOPRINTF_USE_ALT_FORM_FLAG == 1
+    NPF_TEST("1.500000", "%#f", 1.5);
+#endif
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("    1.500000", "%12f", 1.5);
+    NPF_TEST("1.500000    ", "%-12f", 1.5);
+    NPF_TEST("00001.500000", "%012f", 1.5);
+    NPF_TEST("-0001.500000", "%012f", -1.5);
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("0.000000e+00", "%e", 0.0);
+    NPF_TEST("1.500000e+00", "%e", 1.5);
+    NPF_TEST("3.906250e-03", "%e", 0.00390625);
+    NPF_TEST("1.234560e+05", "%e", 123456.0);
+    NPF_TEST("1.500000E+00", "%E", 1.5);
+    NPF_TEST("+1.500000e+00", "%+e", 1.5);
+#if NANOPRINTF_USE_ALT_FORM_FLAG == 1
+    NPF_TEST("1.500000e+00", "%#e", 1.5);
+#endif
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("  1.500000e+00", "%14e", 1.5);
+    NPF_TEST("1.500000e+00  ", "%-14e", 1.5);
+    NPF_TEST("-01.500000e+00", "%014e", -1.5);
+#endif
+#endif
+
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("0", "%g", 0.0);
+    NPF_TEST("1.5", "%g", 1.5);
+    NPF_TEST("0.00390625", "%g", 0.00390625);
+    NPF_TEST("123456", "%g", 123456.0);
+    NPF_TEST("1.5", "%G", 1.5);
+    NPF_TEST("+1.5", "%+g", 1.5);
+#if NANOPRINTF_USE_ALT_FORM_FLAG == 1
+    NPF_TEST("1.50000", "%#g", 1.5);
+#endif
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("         1.5", "%12g", 1.5);
+    NPF_TEST("1.5         ", "%-12g", 1.5);
+    NPF_TEST("-000000001.5", "%012g", -1.5);
+#endif
+#endif
+
+    /* %a's default precision is the full mantissa, which is what the
+       precision-enabled build already emits when no '.' is present. */
+#if NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER == 1
+    NPF_TEST("0x0.0000000000000p+0", "%a", 0.0);
+    NPF_TEST("0x1.8000000000000p+0", "%a", 1.5);
+    NPF_TEST("-0x1.8000000000000p+0", "%a", -1.5);
+    NPF_TEST("0x1.0000000000000p-8", "%a", 0.00390625);
+    NPF_TEST("0x1.e240000000000p+16", "%a", 123456.0);
+    NPF_TEST("0X1.8000000000000P+0", "%A", 1.5);
+    NPF_TEST("+0x1.8000000000000p+0", "%+a", 1.5);
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+    NPF_TEST("      0x1.8000000000000p+0", "%26a", 1.5);
+    NPF_TEST("0x1.8000000000000p+0      ", "%-26a", 1.5);
+    NPF_TEST("-0x000001.8000000000000p+0", "%026a", -1.5);
+#endif
+#endif
+#endif
+
+    /* ===== a conversion whose feature is compiled out is emitted verbatim =====
+
+       This is nanoprintf's signal that the build is misconfigured: you get either
+       the right string or an obviously broken one, never a plausible wrong one.
+       Note that a failed parse never runs va_arg, so the argument stays on the
+       list and shifts every later conversion in the same format string. */
+#if NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 0
+    NPF_TEST("%f", "%f", 1.5);
+    NPF_TEST("%F", "%F", 1.5);
+    NPF_TEST("%e", "%e", 1.5);
+    NPF_TEST("%g", "%g", 1.5);
+    NPF_TEST("%.3f", "%.3f", 1.5);
+    NPF_TEST("%Lf", "%Lf", (long double)1.5);
+    NPF_TEST("[%f]", "[%f]", 1.5);
+#else
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 0
+    NPF_TEST("%e", "%e", 1.5);
+    NPF_TEST("%E", "%E", 1.5);
+    NPF_TEST("%.3e", "%.3e", 1.5);
+    NPF_TEST("%+12.3E", "%+12.3E", 1.5);
+    NPF_TEST("[%e]", "[%e]", 1.5);
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 0
+    NPF_TEST("%g", "%g", 1.5);
+    NPF_TEST("%G", "%G", 1.5);
+    NPF_TEST("%.3g", "%.3g", 1.5);
+    NPF_TEST("%-12.3G", "%-12.3G", 1.5);
+    NPF_TEST("[%g]", "[%g]", 1.5);
+#endif
+#if NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER == 0
+    NPF_TEST("%a", "%a", 1.5);
+    NPF_TEST("%.3A", "%.3A", 1.5);
+#endif
+#endif
+#if NANOPRINTF_USE_BINARY_FORMAT_SPECIFIERS == 0
+    NPF_TEST("%b", "%b", 5u);
+    NPF_TEST("%B", "%B", 5u);
+    NPF_TEST("%.3b", "%.3b", 5u);
+#endif
+#if NANOPRINTF_USE_WRITEBACK_FORMAT_SPECIFIERS == 0
+    { int npf_wb_unused = 0; NPF_TEST("ab%n", "ab%n", &npf_wb_unused); }
+#endif
+#if NANOPRINTF_USE_LARGE_FORMAT_SPECIFIERS == 0
+    NPF_TEST("%lld", "%lld", 5LL);
+    NPF_TEST("%jd", "%jd", (long long)5);
+    NPF_TEST("%zd", "%zd", (long long)5);
+    NPF_TEST("%td", "%td", (long long)5);
+#endif
+#if NANOPRINTF_USE_SMALL_FORMAT_SPECIFIERS == 0
+    NPF_TEST("%hd", "%hd", 5);
+    NPF_TEST("%hhd", "%hhd", 5);
+#endif
+#if NANOPRINTF_USE_FIXED_WIDTH_FORMAT_SPECIFIERS == 0
+    NPF_TEST("%w8d", "%w8d", 5);
+    NPF_TEST("%w16u", "%w16u", 5u);
+    NPF_TEST("%w32x", "%w32x", 5u);
+    NPF_TEST("%wf8d", "%wf8d", 5);
+    NPF_TEST("%wf64d", "%wf64d", 5);
+#endif
+#if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 0
+    NPF_TEST("%.3d", "%.3d", 5);
+    NPF_TEST("%.*d", "%.*d", 3, 5);
+    NPF_TEST("%.3s", "%.3s", "hello");
+#if NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 1
+    NPF_TEST("%.2f", "%.2f", 1.5);
+    NPF_TEST("%.0F", "%.0F", 1.5);
+    NPF_TEST("%.*f", "%.*f", 2, 1.5);
+    NPF_TEST("%8.2f", "%8.2f", 1.5);
+    NPF_TEST("[%.2f]", "[%.2f]", 1.5);
+#if NANOPRINTF_USE_FLOAT_SCI_FORMAT_SPECIFIER == 1
+    NPF_TEST("%.3e", "%.3e", 1.5);
+#endif
+#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
+    NPF_TEST("%.3g", "%.3g", 1.5);
+#endif
+#if NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER == 1
+    NPF_TEST("%.3a", "%.3a", 1.5);
+#endif
+#endif
+#endif
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 0
+    NPF_TEST("%5d", "%5d", 5);
+    NPF_TEST("%-5d", "%-5d", 5);
+    NPF_TEST("%05d", "%05d", 5);
+#endif
+#if NANOPRINTF_USE_ALT_FORM_FLAG == 0
+    NPF_TEST("%#x", "%#x", 5u);
+    NPF_TEST("%#o", "%#o", 5u);
+#endif
 
     /* ===== non-standard specifiers ===== */
 
